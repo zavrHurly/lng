@@ -35,7 +35,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>src.main.java.Lng</mainClass>
+                            <mainClass>Lng</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
@@ -53,7 +53,7 @@
                         <configuration>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>src.main.java.Lng</mainClass>
+                                    <mainClass>Lng</mainClass>
                                 </transformer>
                             </transformers>
                         </configuration>
