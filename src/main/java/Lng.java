@@ -1,3 +1,10 @@
+import org.apache.commons.compress.archivers.ArchiveException;
+import org.apache.commons.compress.archivers.sevenz.SevenZArchiveEntry;
+import org.apache.commons.compress.archivers.sevenz.SevenZFile;
+import org.apache.commons.csv.CSVFormat;
+import org.apache.commons.csv.CSVParser;
+import org.apache.commons.csv.CSVRecord;
+
 import java.io.*;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -7,13 +14,53 @@ import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 
+
 public class Lng {
 
+    private static class ExtractedFileInfo implements Closeable {
+        private final InputStream inputStream;
+        private final String filename;
+        private final SevenZFile sevenZFile;
+
+        ExtractedFileInfo(InputStream inputStream, String filename, SevenZFile sevenZFile) {
+            this.inputStream = inputStream;
+            this.filename = filename;
+            this.sevenZFile = sevenZFile;
+        }
+
+        public InputStream getInputStream() {
+            return inputStream;
+        }
+
+        public String getFilename() {
+            return filename;
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                if (inputStream != null) {
+                    inputStream.close();
+                }
+            } finally {
+                if (sevenZFile != null) {
+                    try {
+                        sevenZFile.close();
+                    } catch (IOException e) {
+                        System.err.println("Ошибка при закрытии SevenZFile: " + e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
     static class DSU {
-        private final int[] parent;
+        private int[] parent;
+        private int numSets;
 
         public DSU(int n) {
             parent = new int[n];
+            numSets = n;
             for (int i = 0; i < n; i++) {
                 parent[i] = i;
             }
@@ -31,7 +78,12 @@ public class Lng {
             int rootJ = find(j);
             if (rootI != rootJ) {
                 parent[rootI] = rootJ;
+                numSets--;
             }
+        }
+
+        public int getNumSets() {
+            return numSets;
         }
     }
 
@@ -39,26 +91,103 @@ public class Lng {
         return columnIndex + ":" + value;
     }
 
-    private static int readFileAndProcess(String filePath, List<String> uniqueLines, Map<String, Integer> lineToIndex) throws IOException {
+    private static ExtractedFileInfo getExtractedFileInfo(String filePath) throws IOException {
+        File file = new File(filePath);
+
+        if (filePath.toLowerCase().endsWith(".gz")) {
+            return new ExtractedFileInfo(new GZIPInputStream(new FileInputStream(file)), file.getName(), null);
+        } else if (filePath.toLowerCase().endsWith(".7z")) {
+            return getExtractedFileInfoFrom7zArchiveCommonsCompress(file);
+        } else {
+            return new ExtractedFileInfo(new FileInputStream(file), file.getName(), null);
+        }
+    }
+
+    private static ExtractedFileInfo getExtractedFileInfoFrom7zArchiveCommonsCompress(File archiveFile) throws IOException {
+        SevenZFile sevenZFile = null;
+        InputStream fileEntryStream = null;
+        String extractedFilename = null;
+
+        try {
+            sevenZFile = new SevenZFile(archiveFile);
+            List<SevenZArchiveEntry> entries = new ArrayList<>();
+            for (SevenZArchiveEntry entry : sevenZFile.getEntries()) {
+                entries.add(entry);
+            }
+
+            if (entries.isEmpty()) {
+                throw new IOException("В 7z архиве '" + archiveFile.getName() + "' не найдены файлы.");
+            }
+
+            SevenZArchiveEntry entryToExtract = null;
+            for (SevenZArchiveEntry entry : entries) {
+                if (!entry.isDirectory()) {
+                    entryToExtract = entry;
+                    extractedFilename = entry.getName();
+                    break;
+                }
+            }
+
+            if (entryToExtract == null) {
+                throw new IOException("В 7z архиве '" + archiveFile.getName() + "' не найден ни один файл.");
+            }
+
+            fileEntryStream = sevenZFile.getInputStream(entryToExtract);
+            return new ExtractedFileInfo(fileEntryStream, extractedFilename, sevenZFile);
+
+        } catch (IOException e) {
+            if (sevenZFile != null) {
+                try {
+                    sevenZFile.close();
+                } catch (IOException ignored) {}
+            }
+            throw new IOException("Ошибка при работе с 7z архивом '" + archiveFile.getName() + "': " + e.getMessage(), e);
+        }
+    }
+
+    private static int readFileAndProcess(ExtractedFileInfo extractedInfo, List<String> uniqueLines, Map<String, Integer> lineToIndex) throws IOException {
+        String filename = extractedInfo.getFilename();
+        boolean isCsv = filename != null && filename.toLowerCase().endsWith(".csv");
+
+        try (InputStream fileStream = extractedInfo.getInputStream()) {
+            if (isCsv) {
+                return parseCsvFormat(fileStream, filename, uniqueLines, lineToIndex);
+            } else {
+                return parseOriginalFormat(fileStream, filename, uniqueLines, lineToIndex);
+            }
+        }
+    }
+
+    private static int parseOriginalFormat(InputStream inputStream, String filename, List<String> uniqueLines, Map<String, Integer> lineToIndex) throws IOException {
         int currentUniqueLineIndex = 0;
+        int linesReadCount = 0;
+        int skippedLinesCount = 0;
+        int addedUniqueLinesCount = 0;
 
-        try (InputStream fileStream = new FileInputStream(filePath);
-             InputStream is = filePath.endsWith(".gz") ? new GZIPInputStream(fileStream) : fileStream;
-             BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8))) {
-
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream, StandardCharsets.UTF_8))) {
             String line;
-            int addedUniqueLinesCount = 0;
-
             while ((line = reader.readLine()) != null) {
+                linesReadCount++;
+                boolean isValidLine = true;
+                String skipReason = "";
 
-                if (line.contains(";")) {
+                if (!line.contains(";")) {
+                    isValidLine = false;
+                    skipReason = "нет разделителя ';'";
+                } else {
                     String[] parts = line.split(";", -1);
-
                     for (String part : parts) {
                         if (part.length() < 2 || !part.startsWith("\"") || !part.endsWith("\"")) {
+                            isValidLine = false;
+                            skipReason = "некорректное поле: " + part;
                             break;
                         }
                     }
+                }
+
+                if (!isValidLine) {
+                    skippedLinesCount++;
+                    continue;
                 }
 
                 if (!lineToIndex.containsKey(line)) {
@@ -67,69 +196,122 @@ public class Lng {
                     addedUniqueLinesCount++;
                 }
             }
-
-            return addedUniqueLinesCount;
-        } catch (FileNotFoundException e) {
-            System.err.println("Файл не найден: " + filePath);
-            throw e;
-        } catch (IOException e) {
-            System.err.println("Ошибка ввода-вывода при чтении файла: " + e.getMessage());
-            throw e;
         }
+
+        return addedUniqueLinesCount;
     }
 
-    private static void buildDSU(List<String> uniqueLines, DSU dsu, Map<String, Integer> featureToLineIndex) {
-        int numberOfUniqueLines = uniqueLines.size();
-        for (int i = 0; i < numberOfUniqueLines; i++) {
-            String currentLine = uniqueLines.get(i);
-            String[] quotedParts = currentLine.split(";", -1);
+    private static int parseCsvFormat(InputStream inputStream, String filename, List<String> uniqueLines, Map<String, Integer> lineToIndex) throws IOException {
+        int currentUniqueLineIndex = 0;
+        int addedUniqueLinesCount = 0;
 
-            for (int colIndex = 0; colIndex < quotedParts.length; colIndex++) {
-                String quotedValue = quotedParts[colIndex];
+        CSVFormat csvFormat = CSVFormat.DEFAULT.builder()
+                .setDelimiter(',')
+                .setQuote(null)
+                .setEscape(null)
+                .setRecordSeparator("\n")
+                .setIgnoreEmptyLines(true)
+                .setTrim(true)
+                .build();
 
-                String value = quotedValue.substring(1, quotedValue.length() - 1);
+        try (Reader reader = new InputStreamReader(inputStream, StandardCharsets.UTF_8);
+             CSVParser csvParser = new CSVParser(reader, csvFormat)) {
 
-                if (!value.isEmpty()) {
-                    String featureKey = createFeatureKey(colIndex, value);
-                    if (featureToLineIndex.containsKey(featureKey)) {
-                        dsu.union(i, featureToLineIndex.get(featureKey));
-                    } else {
-                        featureToLineIndex.put(featureKey, i);
+            for (CSVRecord csvRecord : csvParser) {
+                StringBuilder reconstructedLine = new StringBuilder();
+                boolean firstField = true;
+                for (String field : csvRecord) {
+                    if (!firstField) reconstructedLine.append(',');
+                    reconstructedLine.append(field);
+                    firstField = false;
+                }
+                String processedLine = reconstructedLine.toString();
+
+                if (!lineToIndex.containsKey(processedLine)) {
+                    uniqueLines.add(processedLine);
+                    lineToIndex.put(processedLine, currentUniqueLineIndex++);
+                    addedUniqueLinesCount++;
+                }
+            }
+        }
+        return addedUniqueLinesCount;
+    }
+
+    private static void buildDSU(List<String> uniqueLines, DSU dsu, Map<String, Integer> featureToLineIndex) throws IOException {
+        featureToLineIndex.clear();
+        for (int i = 0; i < uniqueLines.size(); i++) {
+            String line = uniqueLines.get(i);
+
+            if (line.contains(";")) {
+                String[] parts = line.split(";", -1);
+                for (int colIndex = 0; colIndex < parts.length; colIndex++) {
+                    String part = parts[colIndex];
+                    if (part.length() >= 2 && part.startsWith("\"") && part.endsWith("\"")) {
+                        String value = part.substring(1, part.length() - 1);
+                        value = value.replace("\"\"", "\"");
+                        if (!value.isEmpty()) {
+                            String featureKey = createFeatureKey(colIndex, value);
+                            if (featureToLineIndex.containsKey(featureKey)) {
+                                dsu.union(i, featureToLineIndex.get(featureKey));
+                            } else {
+                                featureToLineIndex.put(featureKey, i);
+                            }
+                        }
+                    }
+                }
+            }
+            else if (line.contains(",")) {
+                String[] parts = line.split(",", -1);
+                for (int colIndex = 0; colIndex < parts.length; colIndex++) {
+                    String value = parts[colIndex].trim();
+
+                    if (!value.isEmpty()) {
+                        String featureKey = createFeatureKey(colIndex, value);
+                        if (featureToLineIndex.containsKey(featureKey)) {
+                            dsu.union(i, featureToLineIndex.get(featureKey));
+                        } else {
+                            featureToLineIndex.put(featureKey, i);
+                        }
                     }
                 }
             }
         }
     }
 
-
     public static void main(String[] args) {
+        // --- ДОБАВЛЕНО: Замер времени выполнения с самого начала ---
+        long startTime = System.currentTimeMillis();
+
         if (args.length == 0) {
-            System.err.println("Использование: java -jar <имя_jar_файла> <полный_путь_к_входному_файлу>");
+            System.err.println("Использование: java -jar <jar> <file>");
             System.exit(1);
         }
 
-        long startTime = System.currentTimeMillis();
         String filePath = args[0];
-
         List<String> uniqueLines = new ArrayList<>();
         Map<String, Integer> lineToIndex = new HashMap<>();
         Map<String, Integer> featureToLineIndex = new HashMap<>();
-        int numberOfUniqueValidLines;
+        int numberOfUniqueValidLines = 0;
 
-        try {
-            numberOfUniqueValidLines = readFileAndProcess(filePath, uniqueLines, lineToIndex);
+        // --- Здесь мы получаем startTime ---
+        // startTime уже объявлена выше
+
+        try (ExtractedFileInfo extractedInfo = getExtractedFileInfo(filePath)) {
+            numberOfUniqueValidLines = readFileAndProcess(extractedInfo, uniqueLines, lineToIndex);
 
             if (numberOfUniqueValidLines == 0) {
-                System.out.println("Входной файл '" + filePath + "' пуст или не содержит корректных строк для обработки согласно формату \"<val1>\";\"<val2>\";...");
-
-                System.out.println("Количество групп с более чем одним элементом: 0");
-                System.out.println("\nРезультаты сгруппированы в файле: result.txt");
+                // Если нет данных, выводим пустые результаты и статистику
                 try (PrintWriter writer = new PrintWriter("result.txt", StandardCharsets.UTF_8)) {
-                    writer.println(0);
-                    writer.println();
+                    writer.println(0); // 0 групп с более чем одним элементом
                 }
-                System.out.println("Время выполнения: " + (System.currentTimeMillis() - startTime) / 1000.0 + " сек");
-                return;
+                // --- ВЫВОД СТАТИСТИКИ при раннем выходе ---
+                long endTime = System.currentTimeMillis();
+                System.out.println("----------------------------------------------");
+                System.out.println("Обработка завершена (нет данных для анализа).");
+                System.out.println("Количество групп с более чем одним элементом: 0");
+                System.out.println("Время выполнения: " + (endTime - startTime) / 1000.0 + " секунд");
+                System.out.println("----------------------------------------------");
+                return; // Завершаем выполнение
             }
 
             DSU dsu = new DSU(numberOfUniqueValidLines);
@@ -144,6 +326,7 @@ public class Lng {
             List<List<Integer>> sortedGroups = groupsMap.values().stream()
                     .sorted((g1, g2) -> Integer.compare(g2.size(), g1.size()))
                     .collect(Collectors.toList());
+
             long groupsWithMoreThanOne = sortedGroups.stream()
                     .filter(group -> group.size() > 1)
                     .count();
@@ -151,32 +334,22 @@ public class Lng {
             try (PrintWriter writer = new PrintWriter("result.txt", StandardCharsets.UTF_8)) {
                 writer.println(groupsWithMoreThanOne);
                 writer.println();
-
                 int groupLabelCounter = 1;
                 for (List<Integer> groupIndices : sortedGroups) {
-                    writer.println("Группа " + groupLabelCounter++);
-                    for (int lineIndex : groupIndices) {
-                        writer.println(uniqueLines.get(lineIndex));
+                    if (groupIndices.size() > 1) {
+                        writer.println("Группа " + groupLabelCounter++);
+                        for (int lineIndex : groupIndices) {
+                            writer.println(uniqueLines.get(lineIndex));
+                        }
+                        writer.println();
                     }
-                    writer.println();
                 }
             }
-
             long endTime = System.currentTimeMillis();
             System.out.println("Количество групп с более чем одним элементом: " + groupsWithMoreThanOne);
-            System.out.println("Время выполнения: " + (endTime - startTime) / 1000.0 + " сек");
+            System.out.println("Время выполнения: " + (endTime - startTime) / 1000.0 + " секунд");
 
-        } catch (FileNotFoundException e) {
-            System.err.println("Ошибка: Файл не найден по пути '" + filePath + "'.");
-            System.err.println("Пожалуйста, убедитесь, что путь к файлу указан верно и файл существует.");
-            System.exit(1);
-        } catch (IOException e) {
-            System.err.println("Ошибка при чтении файла '" + filePath + "'.");
-            System.err.println("Возможно, файл поврежден, имеет неверный формат (например, .gz файл не является gzip-архивом) или возникла другая проблема ввода-вывода.");
-            System.err.println("Детали ошибки: " + e.getMessage());
-            System.exit(1);
         } catch (Exception e) {
-            System.err.println("Произошла непредвиденная ошибка:");
             e.printStackTrace();
             System.exit(1);
         }
